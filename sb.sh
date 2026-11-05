@@ -1279,8 +1279,13 @@ uninstall_all() {
     need_root
     echo ""
     r "即将完全卸载 sing-box / cloudflared / 所有配置与节点信息!"
-    reading "确认卸载? (y/n): " yn
-    [ "${yn}" != "y" ] && { w "已取消"; return 0; }
+    if [ -t 0 ]; then
+        reading "确认卸载? (y/n): " yn
+        [ "${yn}" != "y" ] && { w "已取消"; return 0; }
+    else
+        [ "${UNINSTALL_CONFIRM:-}" = "1" ] || { r "非交互环境卸载需显式设置环境变量 UNINSTALL_CONFIRM=1"; return 1; }
+        w "非交互模式: UNINSTALL_CONFIRM=1, 执行卸载..."
+    fi
     if command_exists systemctl; then
         systemctl disable --now sing-box >/dev/null 2>&1
         systemctl disable --now argo >/dev/null 2>&1
