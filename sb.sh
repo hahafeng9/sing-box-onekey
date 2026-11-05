@@ -1265,6 +1265,130 @@ uninstall_all() {
     g "已完全卸载"
 }
 
+# ---------- Argo 链路自检/修复 ----------
+argo_diagnose() {
+    need_root
+    load_vars_from_conf
+    [ ! -f "${CONF_DIR}/argo-inbound.json" ] && { r "未检测到 Argo 入站, 请先菜单 3 配置 (或菜单 1 重装)"; return 1; }
+    local dom mode
+    dom=$(argo_domain_value)
+    mode="off"
+    [ -f "${SB_DIR}/argo_mode" ] && mode=$(cat "${SB_DIR}/argo_mode")
+    echo ""
+    c "════════ Argo 链路自检 ════════"
+    w "模式: ${mode}   回源协议: ${ARGO_SRC}   回源端口: ${ARGO_PORT}"
+
+    if [ "${mode}" = "off" ]; then
+        r "[0] Argo 未启用, 菜单 3 配置固定隧道或菜单 1 重装"
+        return 1
+    fi
+
+    # [1] cloudflared 服务状态
+    local svc_st="unknown"
+    if command_exists systemctl && systemctl list-unit-files 2>/dev/null | grep -q "^argo.service"; then
+        svc_st=$(systemctl is-active argo 2>/dev/null)
+    elif [ -f /etc/init.d/argo ]; then
+        rc-service argo status >/dev/null 2>&1 && svc_st="active" || svc_st="inactive"
+    fi
+    if [ "${svc_st}" = "active" ]; then
+        g "[1] cloudflared 服务: 运行中"
+    else
+        r "[1] cloudflared 服务: ${svc_st} → 尝试自动重启..."
+        if command_exists systemctl; then systemctl restart argo; else rc-service argo restart >/dev/null 2>&1; fi
+        sleep 5
+    fi
+
+    # [2] 隧道边缘注册
+    if [ -f "${ARGO_LOG}" ] && grep -q "Registered tunnel connection" "${ARGO_LOG}"; then
+        g "[2] 隧道边缘注册: 成功"
+    else
+        r "[2] 隧道边缘注册: 无成功记录! argo.log 末尾:"
+        tail -n 5 "${ARGO_LOG}" 2>/dev/null | sed 's/^/      /'
+        y "    → 检查 token 是否正确 / VPS 能否访问 Cloudflare 边缘 (443/7844)"
+    fi
+
+    # [3] sing-box 监听检查
+    if command_exists ss && ss -tln 2>/dev/null | grep -q ":${ARGO_PORT}[[:space:]]"; then
+        g "[3] sing-box 监听 ${ARGO_PORT}: 正常"
+    else
+        r "[3] sing-box 未监听 ${ARGO_PORT}!"
+        grep '"listen_port"' "${CONF_DIR}/argo-inbound.json" 2>/dev/null | sed 's/^/      conf: /'
+        y "    → 若 conf 端口与此不一致, 菜单 6 修正后重启服务"
+    fi
+
+    # [4] 本地回源测试
+    local src_path
+    case "${ARGO_SRC}" in
+        vless)  src_path="${VLESS_PATH}" ;;
+        trojan) src_path="${TROJAN_PATH}" ;;
+        *)      src_path="${VMESS_PATH}" ;;
+    esac
+    local lcode
+    lcode=$(curl -s -o /dev/null -w "%{http_code}" --max-time 5 "http://127.0.0.1:${ARGO_PORT}/${src_path}" 2>/dev/null)
+    case "${lcode}" in
+        400|404|426) g "[4] 本地回源测试: HTTP ${lcode} (正常, WS 端点对普通请求返回 4xx)" ;;
+        *) r "[4] 本地回源测试: HTTP ${lcode} (异常, sing-box 未正确响应)"; return 1 ;;
+    esac
+
+    # [5] CF 边缘全链路测试
+    if [ -z "${dom}" ] || [ "${dom}" = "PENDING" ]; then
+        y "[5] 无隧道域名, 跳过边缘测试 (临时隧道: 菜单 4 刷新域名后再测)"
+        return 0
+    fi
+    local ecode
+    ecode=$(curl -s -o /dev/null -w "%{http_code}" --max-time 12 "https://${dom}/${src_path}" 2>/dev/null)
+    case "${ecode}" in
+        400|426)
+            g "[5] CF 边缘测试: HTTP ${ecode} → ✅ 全链路通! 客户端即可正常使用"
+            ;;
+        404)
+            y "[5] CF 边缘测试: HTTP 404 → 域名未绑定到该隧道 (或 path 未命中)"
+            y "    → 检查 CF dashboard 的 Public Hostname 是否绑定了 ${dom}"
+            ;;
+        502|521|522)
+            r "[5] CF 边缘测试: HTTP ${ecode} → CF 连不到本机 ${ARGO_PORT}"
+            y "    最常见原因: CF dashboard 的 Service 端口 ≠ ${ARGO_PORT}"
+            ;;
+        530|1033)
+            r "[5] CF 边缘测试: HTTP ${ecode} → Tunnel 断连 (cloudflared 掉线或被墙 7844)"
+            ;;
+        403)
+            y "[5] CF 边缘测试: HTTP 403 → CF 安全功能拦截, 检查域名 WAF 设置"
+            ;;
+        000)
+            r "[5] CF 边缘测试: 无法连接 ${dom} → DNS 未生效或域名记录错误"
+            ;;
+        *)
+            y "[5] CF 边缘测试: HTTP ${ecode}"
+            ;;
+    esac
+
+    # [6] 一键修复
+    case "${ecode}" in
+        502|521|522|530|1033)
+            if [ -f "${CF_ENV}" ]; then
+                reading "用 CF API 自动同步 ingress → ${ARGO_PORT} 并重启 argo? (y/n): " fix_yn
+                if [ "${fix_yn}" = "y" ]; then
+                    cf_set_ingress "${dom}" "${ARGO_PORT}"
+                    if command_exists systemctl; then systemctl restart argo; else rc-service argo restart >/dev/null 2>&1; fi
+                    sleep 6
+                    ecode=$(curl -s -o /dev/null -w "%{http_code}" --max-time 12 "https://${dom}/${src_path}" 2>/dev/null)
+                    case "${ecode}" in
+                        400|426) g "✅ 修复成功! 全链路已通 (HTTP ${ecode})" ;;
+                        *) r "仍为 HTTP ${ecode}, 把 argo.log 末尾 5 行发我继续排查" ;;
+                    esac
+                fi
+            else
+                y "修复方式三选一:"
+                y "  A. CF dashboard → Tunnel → Public Hostname → Service 改为 HTTP://localhost:${ARGO_PORT}"
+                y "  B. 菜单 6 把回源端口改成 CF 里现在填的那个端口 (本地跟着变)"
+                y "  C. 菜单 3 重新配置并接入 CF API Token, 以后全部自动同步"
+            fi
+            ;;
+    esac
+    echo ""
+}
+
 # ---------- 菜单 ----------
 show_menu() {
     clear
@@ -1287,13 +1411,14 @@ show_menu() {
     w " 4. 刷新 Argo 临时隧道域名"
     w " 5. 切换 Argo 回源协议 (vmess/vless/trojan)"
     w " 6. 修改 Argo 回源端口 (默认 8001, 有 CF API 自动同步)"
-    w " 7. 重启服务 (sing-box + argo)"
-    w " 8. 更新 sing-box 到最新版"
-    w " 9. Telegram 通知设置/重新推送"
-    w "10. 完全卸载"
+    w " 7. Argo 链路自检/修复 (vmess-argo 不通先跑这个)"
+    w " 8. 重启服务 (sing-box + argo)"
+    w " 9. 更新 sing-box 到最新版"
+    w "10. Telegram 通知设置/重新推送"
+    w "11. 完全卸载"
     w " 0. 退出"
     echo ""
-    reading "请选择 [0-10]: " choice
+    reading "请选择 [0-11]: " choice
 }
 
 menu_action() {
@@ -1304,15 +1429,16 @@ menu_action() {
         4) refresh_temp_domain ;;
         5) switch_argo_source ;;
         6) change_argo_port ;;
-        7) restart_services ;;
-        8) update_singbox ;;
-        9)
+        7) argo_diagnose ;;
+        8) restart_services ;;
+        9) update_singbox ;;
+        10)
             setup_tg
             if [ -f "${INFO_FILE}" ]; then
                 tg_send "$(cat "${INFO_FILE}")" && g "节点信息已推送"
             fi
             ;;
-        10) uninstall_all ;;
+        11) uninstall_all ;;
         0) exit 0 ;;
         *) ;;
     esac
