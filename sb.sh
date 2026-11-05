@@ -68,7 +68,7 @@ need_root() {
 
 rand_hex() { openssl rand -hex "$1" 2>/dev/null || head -c 64 /dev/urandom | od -An -tx1 | tr -d ' \n' | head -c $(( $1 * 2 )); }
 new_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen; }
-rand_num() { echo $(( RANDOM % 40000 + 20000 )); }
+rand_num() { echo $(( RANDOM % 30000 + 30000 )); }   # 30000-59999, 对齐常见云安全组放行习惯
 
 get_ipv4() { curl -4 -sm 5 ip.sb 2>/dev/null || curl -4 -sm 5 ipinfo.io/ip 2>/dev/null; }
 get_ipv6() { curl -6 -sm 5 ip.sb 2>/dev/null; }
