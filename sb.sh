@@ -714,10 +714,14 @@ build_info() {
  [5] Hysteria2 (直连, UDP — 有 IPv6 时优先用 v6, 更不易被墙)
    端口 : ${HY2_PORT} (UDP)  密码: ${HY2_PASS}
    链接 : $(grep '^hysteria2://' "${URL_FILE}" | head -1)
+   💡 电脑通/手机不通? → 小火箭需 2.2.55+ 才支持 hy2, 建议手动填节点
+      (类型 Hysteria2 / 地址 / 端口 / 密码 / SNI: www.bing.com / 允许不安全: 开)
+      仍不通: 试 #Hy2-IPv4 版本, 或换 WiFi/蜂窝对比 (运营商 UDP QoS)
 
  [6] TUIC v5 (直连, UDP — 有 IPv6 时优先用 v6)
    端口 : ${TUIC_PORT} (UDP)  密码: ${TUIC_PASS}
    链接 : $(grep '^tuic://' "${URL_FILE}" | head -1)
+   💡 小火箭对 TUIC 支持不完整, 若导入不通请用 NekoBox/Stash/Surge 等客户端
 
  ⚠ UDP 提示: 云服务器 (AWS/阿里云等) 除系统防火墙外, 还需在控制台
    安全组放行 ${HY2_PORT} 和 ${TUIC_PORT} 的 UDP, 否则 hy2/tuic 不通!
