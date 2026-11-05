@@ -430,7 +430,7 @@ EOF
     if [ "${ARGO_MODE}" != "off" ]; then
         local exec_line
         if [ "${ARGO_MODE}" = "fixed" ]; then
-            exec_line="${CF_BIN} tunnel run --token $(cat "${ARGO_TOKEN_FILE}") --no-autoupdate --edge-ip-version auto"
+            exec_line="${CF_BIN} tunnel run --token $(cat "${ARGO_TOKEN_FILE}") --no-autoupdate --edge-ip-version auto --protocol http2"
         else
             exec_line="${CF_BIN} tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
         fi
@@ -473,7 +473,7 @@ EOF
     if [ "${ARGO_MODE}" != "off" ]; then
         local exec_line
         if [ "${ARGO_MODE}" = "fixed" ]; then
-            exec_line="${CF_BIN} tunnel run --token $(cat "${ARGO_TOKEN_FILE}") --no-autoupdate --edge-ip-version auto"
+            exec_line="${CF_BIN} tunnel run --token $(cat "${ARGO_TOKEN_FILE}") --no-autoupdate --edge-ip-version auto --protocol http2"
         else
             exec_line="${CF_BIN} tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
         fi
@@ -1302,13 +1302,30 @@ argo_diagnose() {
         sleep 5
     fi
 
+    # [1.5] 服务文件升级: 强制 http2 协议 (规避 QUIC/UDP 出站被限 → 530)
+    if [ "${mode}" = "fixed" ] && [ -f /etc/systemd/system/argo.service ] && ! grep -q "protocol http2" /etc/systemd/system/argo.service; then
+        y "[1.5] 检测到旧版 argo 服务 (未强制 http2) → 自动升级并重启..."
+        ARGO_MODE="${mode}"
+        detect_env
+        if [ "${IS_ALPINE}" = "yes" ]; then
+            write_openrc_services
+            rc-service argo restart >/dev/null 2>&1
+        else
+            write_systemd_services
+            systemctl restart argo
+        fi
+        sleep 5
+        g "[1.5] 服务文件已升级 (--protocol http2)"
+    fi
+
     # [2] 隧道边缘注册
     if [ -f "${ARGO_LOG}" ] && grep -q "Registered tunnel connection" "${ARGO_LOG}"; then
         g "[2] 隧道边缘注册: 成功"
     else
         r "[2] 隧道边缘注册: 无成功记录! argo.log 末尾:"
         tail -n 5 "${ARGO_LOG}" 2>/dev/null | sed 's/^/      /'
-        y "    → 检查 token 是否正确 / VPS 能否访问 Cloudflare 边缘 (443/7844)"
+        y "    → 若日志反复 timeout/连接失败: 已强制 http2 (TCP 443), 若仍失败"
+        y "      说明 token 失效 (CF dashboard 重建过隧道) → 菜单 3 重贴 token"
     fi
 
     # [3] sing-box 监听检查
