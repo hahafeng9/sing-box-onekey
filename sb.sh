@@ -36,6 +36,9 @@ ARGO_LOG="${SB_DIR}/argo.log"
 ARGO_DOMAIN_FILE="${SB_DIR}/argo_domain"
 ARGO_TOKEN_FILE="${SB_DIR}/argo_token"
 ARGO_SRC_FILE="${SB_DIR}/argo_source"     # argo 回源协议: vmess|vless|trojan
+ARGO_PORT_FILE="${SB_DIR}/argo_port"      # argo 回源端口, 默认 8001
+ARGO_DEFAULT_PORT="8001"
+CF_ENV="${SB_DIR}/cf_api.env"             # CF_API_TOKEN / CF_ACCOUNT_ID / TUNNEL_ID
 TG_ENV="${SB_DIR}/tg.env"
 SHORTCUT="/usr/local/bin/sb"
 SB_FALLBACK_VER="1.11.4"
@@ -100,11 +103,11 @@ detect_env() {
 install_deps() {
     y "安装基础依赖中..."
     case "${PKG_MGR}" in
-        apt)    apt-get update -y >/dev/null 2>&1; apt-get install -y curl openssl tar gzip cron qrencode >/dev/null 2>&1 ;;
-        dnf)    dnf install -y curl openssl tar gzip crontabs qrencode >/dev/null 2>&1 ;;
-        yum)    yum install -y curl openssl tar gzip crontabs qrencode >/dev/null 2>&1 ;;
-        apk)    apk add --no-cache curl openssl tar gzip qrencode >/dev/null 2>&1 ;;
-        pacman) pacman -Sy --noconfirm curl openssl tar gzip cronie qrencode >/dev/null 2>&1 ;;
+        apt)    apt-get update -y >/dev/null 2>&1; apt-get install -y curl openssl tar gzip cron qrencode jq >/dev/null 2>&1 ;;
+        dnf)    dnf install -y curl openssl tar gzip crontabs qrencode jq >/dev/null 2>&1 ;;
+        yum)    yum install -y curl openssl tar gzip crontabs qrencode jq >/dev/null 2>&1 ;;
+        apk)    apk add --no-cache curl openssl tar gzip qrencode jq >/dev/null 2>&1 ;;
+        pacman) pacman -Sy --noconfirm curl openssl tar gzip cronie qrencode jq >/dev/null 2>&1 ;;
     esac
     command_exists curl || { r "curl 安装失败, 请手动安装: apt install curl"; exit 1; }
 }
@@ -336,6 +339,71 @@ write_tuic_conf() {
 EOF
 }
 
+# Argo 专用入站: 监听 ARGO_PORT (默认 8001), 协议由 ARGO_SRC 决定
+write_argo_inbound_conf() {
+    local src="$1"
+    [ -z "${ARGO_PORT}" ] && ARGO_PORT="${ARGO_DEFAULT_PORT}"
+    case "${src}" in
+        vless)
+            cat > "${CONF_DIR}/argo-inbound.json" << EOF
+{
+  "inbounds": [ {
+    "type": "vless",
+    "tag": "argo-inbound",
+    "listen": "::",
+    "listen_port": ${ARGO_PORT},
+    "users": [ { "uuid": "${UUID}" } ],
+    "transport": {
+      "type": "ws",
+      "path": "/${VLESS_PATH}",
+      "max_early_data": 2048,
+      "early_data_header_name": "Sec-WebSocket-Protocol"
+    }
+  } ]
+}
+EOF
+            ;;
+        trojan)
+            cat > "${CONF_DIR}/argo-inbound.json" << EOF
+{
+  "inbounds": [ {
+    "type": "trojan",
+    "tag": "argo-inbound",
+    "listen": "::",
+    "listen_port": ${ARGO_PORT},
+    "users": [ { "name": "user1", "password": "${TROJAN_PASS}" } ],
+    "transport": {
+      "type": "ws",
+      "path": "/${TROJAN_PATH}",
+      "max_early_data": 2048,
+      "early_data_header_name": "Sec-WebSocket-Protocol"
+    }
+  } ]
+}
+EOF
+            ;;
+        *)
+            cat > "${CONF_DIR}/argo-inbound.json" << EOF
+{
+  "inbounds": [ {
+    "type": "vmess",
+    "tag": "argo-inbound",
+    "listen": "::",
+    "listen_port": ${ARGO_PORT},
+    "users": [ { "uuid": "${UUID}" } ],
+    "transport": {
+      "type": "ws",
+      "path": "/${VMESS_PATH}",
+      "max_early_data": 2048,
+      "early_data_header_name": "Sec-WebSocket-Protocol"
+    }
+  } ]
+}
+EOF
+            ;;
+    esac
+}
+
 # ---------- 服务守护 ----------
 write_systemd_services() {
     cat > /etc/systemd/system/sing-box.service << EOF
@@ -364,7 +432,7 @@ EOF
         if [ "${ARGO_MODE}" = "fixed" ]; then
             exec_line="${CF_BIN} tunnel run --token $(cat "${ARGO_TOKEN_FILE}") --no-autoupdate --edge-ip-version auto"
         else
-            exec_line="${CF_BIN} tunnel --url http://localhost:${VMESS_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
+            exec_line="${CF_BIN} tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
         fi
         cat > /etc/systemd/system/argo.service << EOF
 [Unit]
@@ -407,7 +475,7 @@ EOF
         if [ "${ARGO_MODE}" = "fixed" ]; then
             exec_line="${CF_BIN} tunnel run --token $(cat "${ARGO_TOKEN_FILE}") --no-autoupdate --edge-ip-version auto"
         else
-            exec_line="${CF_BIN} tunnel --url http://localhost:${VMESS_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
+            exec_line="${CF_BIN} tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
         fi
         cat > /etc/init.d/argo << EOF
 #!/sbin/openrc-run
@@ -424,6 +492,102 @@ EOF
     [ -f /etc/init.d/argo ] && rc-update add argo default >/dev/null 2>&1
     rc-service sing-box start >/dev/null 2>&1
     [ -f /etc/init.d/argo ] && rc-service argo start >/dev/null 2>&1
+}
+
+# ---------- Cloudflare API (自动管理固定隧道 ingress / DNS) ----------
+cf_api() {
+    local method="$1" endpoint="$2" data="$3"
+    . "${CF_ENV}"
+    local args=(-s --max-time 20 -X "${method}"
+        -H "Authorization: Bearer ${CF_API_TOKEN}"
+        -H "Content-Type: application/json")
+    [ -n "${data}" ] && args+=(-d "${data}")
+    curl "${args[@]}" "https://api.cloudflare.com/client/v4${endpoint}"
+}
+
+# 校验 CF API Token 并获取 Account ID, 存入 cf_api.env
+cf_init() {
+    . "${CF_ENV}"
+    local resp
+    resp=$(curl -s --max-time 20 -H "Authorization: Bearer ${CF_API_TOKEN}" \
+        "https://api.cloudflare.com/client/v4/user/tokens/verify")
+    [ "$(echo "${resp}" | jq -r '.success // false')" != "true" ] && { r "CF API Token 校验失败 (检查 token 是否有效)"; return 1; }
+    resp=$(cf_api GET "/accounts")
+    local aid
+    aid=$(echo "${resp}" | jq -r '.result[0].id // empty')
+    [ -z "${aid}" ] && { r "无法获取 Account ID (token 需要 Account 权限)"; return 1; }
+    echo "CF_ACCOUNT_ID=${aid}" >> "${CF_ENV}"
+    g "CF API 接入成功, Account: ${aid}"
+    return 0
+}
+
+# 选择 Tunnel, 返回 tunnel id
+cf_pick_tunnel() {
+    . "${CF_ENV}"
+    local resp
+    resp=$(cf_api GET "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel?is_deleted=false&per_page=20")
+    [ "$(echo "${resp}" | jq -r '.success // false')" != "true" ] && { r "获取隧道列表失败"; return 1; }
+    echo ""
+    w "你的 Cloudflare Tunnels:"
+    echo "${resp}" | jq -r '.result[] | "  \(.id)  \(.name)  状态[\(.status // "?")]"'
+    echo ""
+    reading "输入要使用的 Tunnel ID (从上面复制): " tid
+    echo "${tid}" | grep -qE '^[0-9a-f-]{36}$' || { r "Tunnel ID 格式不对"; return 1; }
+    CF_TUNNEL_ID="${tid}"
+    sed -i '/^TUNNEL_ID=/d' "${CF_ENV}"
+    echo "TUNNEL_ID=${tid}" >> "${CF_ENV}"
+    return 0
+}
+
+# 自动配置 DNS CNAME: hostname → tunnel_id.cfargotunnel.com
+cf_ensure_dns() {
+    local hostname="$1" tid="$2"
+    local zone_name resp zone_id
+    zone_name=$(echo "${hostname}" | awk -F. '{if (NF>=2) print $(NF-1)"."$NF; else print $0}')
+    resp=$(cf_api GET "/zones?name=${zone_name}")
+    zone_id=$(echo "${resp}" | jq -r '.result[0].id // empty')
+    if [ -z "${zone_id}" ]; then
+        y "⚠ 未找到 zone ${zone_name} (token 无 DNS 权限或域名不在该账号), 请手动确认 DNS CNAME 指向 ${tid}.cfargotunnel.com"
+        return 0
+    fi
+    resp=$(cf_api GET "/zones/${zone_id}/dns_records?type=CNAME&name=${hostname}")
+    if [ "$(echo "${resp}" | jq '.result | length')" -gt 0 ]; then
+        g "DNS CNAME 已存在: ${hostname}"
+        return 0
+    fi
+    resp=$(cf_api POST "/zones/${zone_id}/dns_records" \
+        "{\"type\":\"CNAME\",\"name\":\"${hostname}\",\"content\":\"${tid}.cfargotunnel.com\",\"proxied\":true}")
+    if [ "$(echo "${resp}" | jq -r '.success // false')" = "true" ]; then
+        g "DNS CNAME 已自动创建: ${hostname} → ${tid}.cfargotunnel.com"
+    else
+        y "DNS 创建失败 (可能无 Zone:DNS:Edit 权限), 请手动添加 CNAME ${hostname} → ${tid}.cfargotunnel.com"
+    fi
+    return 0
+}
+
+# 更新 Tunnel ingress: 指定 hostname 的 service 改为 http://localhost:port
+cf_set_ingress() {
+    local hostname="$1" port="$2"
+    . "${CF_ENV}"
+    command -v jq >/dev/null 2>&1 || { y "缺 jq, 请手动在 CF dashboard 修改 Public Hostname"; return 1; }
+    local resp cfg payload
+    resp=$(cf_api GET "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations")
+    [ "$(echo "${resp}" | jq -r '.success // false')" != "true" ] && { r "读取隧道配置失败 (token 需 Cloudflare Tunnel:Edit 权限)"; return 1; }
+    cfg=$(echo "${resp}" | jq -c '.result.config')
+    payload=$(echo "${cfg}" | jq -c --arg h "${hostname}" --arg s "http://localhost:${port}" '
+        (.ingress // []) as $cur
+        | if ($cur | length) == 0 or ([ $cur[] | (.hostname // "") == $h ] | any | not)
+          then ([{"hostname":$h,"service":$s}] + $cur)
+          else ($cur | map(if (.hostname // "") == $h then (.service = $s) else . end)) end
+        | {"config": {"ingress": .}}')
+    resp=$(cf_api PUT "/accounts/${CF_ACCOUNT_ID}/cfd_tunnel/${TUNNEL_ID}/configurations" "${payload}")
+    if [ "$(echo "${resp}" | jq -r '.success // false')" = "true" ]; then
+        g "CF ingress 已更新: ${hostname} → http://localhost:${port}"
+        return 0
+    else
+        r "ingress 更新失败: $(echo "${resp}" | jq -r '.errors[0].message // "未知错误"')"
+        return 1
+    fi
 }
 
 # ---------- Telegram ----------
@@ -473,16 +637,20 @@ build_links() {
     argo_domain=$(argo_domain_value)
     : > "${URL_FILE}"
 
-    # --- 直连节点 ---
+    # --- IPv6 直连节点 (UDP 协议走 IPv6 更不易被墙, 排在前面) ---
+    if [ -n "${ipv6_add}" ]; then
+        echo "hysteria2://${HY2_PASS}@[${ipv6_add}]:${HY2_PORT}/?sni=www.bing.com&insecure=1#Hy2-IPv6" >> "${URL_FILE}"
+        echo "tuic://${UUID}:${TUIC_PASS}@[${ipv6_add}]:${TUIC_PORT}?sni=www.bing.com&congestion_control=bbr&alpn=h3&insecure=1#TUIC5-IPv6" >> "${URL_FILE}"
+        echo "vless://${UUID}@[${ipv6_add}]:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SID}&type=tcp#Reality-IPv6" >> "${URL_FILE}"
+    fi
+
+    # --- IPv4 直连节点 ---
     if [ -n "${ip_add}" ]; then
         echo "vless://${UUID}@${ip_add}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SID}&type=tcp#Reality-${ip_add}" >> "${URL_FILE}"
         vmess_link "${ip_add}" "${VMESS_PORT}" "" "" "VMess-WS-${ip_add}" >> "${URL_FILE}"
         echo "vless://${UUID}@${ip_add}:${VLESS_PORT}?encryption=none&security=none&type=ws&host=&path=/${VLESS_PATH}#VLESS-WS-${ip_add}" >> "${URL_FILE}"
-        echo "hysteria2://${HY2_PASS}@${ip_add}:${HY2_PORT}/?sni=www.bing.com&insecure=1#Hy2-${ip_add}" >> "${URL_FILE}"
-        echo "tuic://${UUID}:${TUIC_PASS}@${ip_add}:${TUIC_PORT}?sni=www.bing.com&congestion_control=bbr&alpn=h3&insecure=1#TUIC5-${ip_add}" >> "${URL_FILE}"
-    fi
-    if [ -n "${ipv6_add}" ] && [ -n "${ip_add}" ]; then
-        echo "vless://${UUID}@${ipv6_add}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.microsoft.com&fp=chrome&pbk=${REALITY_PUBLIC_KEY}&sid=${REALITY_SID}&type=tcp#Reality-IPv6" >> "${URL_FILE}"
+        echo "hysteria2://${HY2_PASS}@${ip_add}:${HY2_PORT}/?sni=www.bing.com&insecure=1#Hy2-IPv4" >> "${URL_FILE}"
+        echo "tuic://${UUID}:${TUIC_PASS}@${ip_add}:${TUIC_PORT}?sni=www.bing.com&congestion_control=bbr&alpn=h3&insecure=1#TUIC5-IPv4" >> "${URL_FILE}"
     fi
 
     # --- Argo 节点 (按当前回源协议生成) ---
@@ -511,6 +679,8 @@ build_info() {
     argo_domain=$(argo_domain_value)
     local src="vmess"
     [ -f "${ARGO_SRC_FILE}" ] && src=$(cat "${ARGO_SRC_FILE}")
+    local ARGO_PORT="${ARGO_DEFAULT_PORT}"
+    [ -f "${ARGO_PORT_FILE}" ] && ARGO_PORT=$(cat "${ARGO_PORT_FILE}")
 
     cat > "${INFO_FILE}" << EOF
 ================================================
@@ -541,13 +711,16 @@ build_info() {
    端口 : ${TROJAN_PORT} (TCP)  Path: /${TROJAN_PATH}
    密码 : ${TROJAN_PASS}
 
- [5] Hysteria2 (直连, UDP)
+ [5] Hysteria2 (直连, UDP — 有 IPv6 时优先用 v6, 更不易被墙)
    端口 : ${HY2_PORT} (UDP)  密码: ${HY2_PASS}
    链接 : $(grep '^hysteria2://' "${URL_FILE}" | head -1)
 
- [6] TUIC v5 (直连, UDP)
+ [6] TUIC v5 (直连, UDP — 有 IPv6 时优先用 v6)
    端口 : ${TUIC_PORT} (UDP)  密码: ${TUIC_PASS}
    链接 : $(grep '^tuic://' "${URL_FILE}" | head -1)
+
+ ⚠ UDP 提示: 云服务器 (AWS/阿里云等) 除系统防火墙外, 还需在控制台
+   安全组放行 ${HY2_PORT} 和 ${TUIC_PORT} 的 UDP, 否则 hy2/tuic 不通!
 ------------------------------------------------
  Argo 隧道 :
 EOF
@@ -556,7 +729,8 @@ EOF
             *trycloudflare.com) echo "   临时域名 : ${argo_domain} (重启会变, 菜单可刷新)" >> "${INFO_FILE}" ;;
             *)                  echo "   固定域名 : ${argo_domain}" >> "${INFO_FILE}" ;;
         esac
-        echo "   当前回源 : ${src} (端口见上, 菜单可切换)" >> "${INFO_FILE}"
+        echo "   当前回源 : ${src} → http://localhost:${ARGO_PORT} (菜单一键切换协议/端口)" >> "${INFO_FILE}"
+        echo "   CF 配置  : dashboard 的 Public Hostname Service 填 HTTP://localhost:${ARGO_PORT}" >> "${INFO_FILE}"
         local argo_link=""
         case "${src}" in
             vless)  argo_link=$(grep -E "^vless.*@${argo_domain}" "${URL_FILE}" | head -1) ;;
@@ -674,6 +848,15 @@ install_all() {
             else
                 echo "PENDING" > "${ARGO_DOMAIN_FILE}"
             fi
+            # 可选 CF API 自动配置
+            if [ -n "${CF_API_TOKEN:-}" ]; then
+                echo "CF_API_TOKEN=${CF_API_TOKEN}" > "${CF_ENV}" && chmod 600 "${CF_ENV}"
+                cf_init && cf_pick_tunnel && \
+                    cf_ensure_dns "$(cat "${ARGO_DOMAIN_FILE}")" "${CF_TUNNEL_ID}" && \
+                    cf_set_ingress "$(cat "${ARGO_DOMAIN_FILE}")" "${ARGO_PORT}" || true
+            else
+                y "提示: 提供 CF_API_TOKEN 环境变量可全自动配置域名与回源端口"
+            fi
             ;;
         *)
             ARGO_MODE="off"
@@ -681,6 +864,39 @@ install_all() {
             ;;
     esac
     echo "vmess" > "${ARGO_SRC_FILE}"   # argo 默认回源 vmess-ws
+
+    # --- Argo 回源端口 (默认 8001) ---
+    ARGO_PORT="${ARGO_PORT_ENV:-${ARGO_DEFAULT_PORT}}"
+    if [ "${ARGO_MODE}" != "off" ]; then
+        if [ -z "${ARGO_PORT_ENV:-}" ] && [ -t 0 ]; then
+            reading "Argo 回源端口 (CF Service 填这个端口, 回车默认 ${ARGO_DEFAULT_PORT}): " user_argo_port
+            [ -n "${user_argo_port}" ] && ARGO_PORT="${user_argo_port}"
+        fi
+        if ! [ "${ARGO_PORT}" -ge 1000 ] 2>/dev/null || ! [ "${ARGO_PORT}" -le 65535 ] 2>/dev/null; then
+            y "端口不合法, 使用默认 ${ARGO_DEFAULT_PORT}"; ARGO_PORT="${ARGO_DEFAULT_PORT}"
+        fi
+        # 与协议端口段冲突时顺延重排
+        local conflict=1 tries=0
+        while [ "${conflict}" = "1" ] && [ "${tries}" -lt 6 ]; do
+            conflict=0
+            local _i
+            for _i in 0 1 2 3 4 5; do
+                [ $(( BASE_PORT + _i )) -eq "${ARGO_PORT}" ] && conflict=1 && break
+            done
+            if [ "${conflict}" = "1" ]; then
+                y "回源端口 ${ARGO_PORT} 与协议端口段 ${BASE_PORT}-$((BASE_PORT+5)) 重叠, 起始端口顺延..."
+                pick_ports $(( BASE_PORT + 10 )) || { r "端口分配失败"; return 1; }
+                REALITY_PORT=$(( BASE_PORT ))
+                VMESS_PORT=$(( BASE_PORT + 1 ))
+                VLESS_PORT=$(( BASE_PORT + 2 ))
+                TROJAN_PORT=$(( BASE_PORT + 3 ))
+                HY2_PORT=$(( BASE_PORT + 4 ))
+                TUIC_PORT=$(( BASE_PORT + 5 ))
+            fi
+            tries=$(( tries + 1 ))
+        done
+        echo "${ARGO_PORT}" > "${ARGO_PORT_FILE}"
+    fi
 
     # --- 下载 ---
     download_singbox "$(get_latest_sb_ver)" || return 1
@@ -705,6 +921,9 @@ install_all() {
     write_trojan_conf
     write_hysteria2_conf
     write_tuic_conf
+    if [ "${ARGO_MODE}" != "off" ]; then
+        write_argo_inbound_conf "$(cat "${ARGO_SRC_FILE}")"
+    fi
 
     "${SB_BIN}" check -C "${CONF_DIR}" >/dev/null 2>&1 \
         || { r "配置校验失败, 请检查 ${CONF_DIR}"; return 1; }
@@ -716,6 +935,7 @@ install_all() {
     open_port "${TROJAN_PORT}" tcp
     open_port "${HY2_PORT}" udp
     open_port "${TUIC_PORT}" udp
+    [ "${ARGO_MODE}" != "off" ] && open_port "${ARGO_PORT}" tcp
 
     # --- 服务 ---
     if [ "${IS_ALPINE}" = "yes" ]; then
@@ -797,49 +1017,83 @@ refresh_temp_domain() {
     g "节点信息已刷新"
 }
 
+# 询问接入 CF API 并选择 Tunnel; 成功后 CF_ENV / CF_TUNNEL_ID 就绪
+ask_cfapi_setup() {
+    if [ -t 0 ]; then
+        reading "接入 Cloudflare API 自动配域名/回源端口? (强烈推荐, y/n): " api_yn
+        [ "${api_yn}" != "y" ] && return 1
+    fi
+    local token="${CF_API_TOKEN:-}"
+    if [ -z "${token}" ] && [ -t 0 ]; then
+        reading "输入 CF API Token (权限: Account/Cloudflare Tunnel/Edit + Zone/DNS/Edit): " token
+    fi
+    [ -z "${token}" ] && { y "未提供 CF API Token, 跳过自动配置"; return 1; }
+    echo "CF_API_TOKEN=${token}" > "${CF_ENV}" && chmod 600 "${CF_ENV}"
+    cf_init || { rm -f "${CF_ENV}"; return 1; }
+    cf_pick_tunnel || { rm -f "${CF_ENV}"; return 1; }
+    return 0
+}
+
 set_fixed_tunnel() {
     need_root
     detect_env
-    echo ""
-    y "── 添加/更换 Argo 固定隧道 ──"
-    y "前提: 已在 Cloudflare Zero Trust → Networks → Tunnels 创建隧道"
-    y "      并在 Public Hostname 绑定域名 → Service: HTTP://localhost:<回源端口>"
-    echo ""
-    reading "输入 Tunnel Token: " token
-    [ -z "${token}" ] && { r "token 不能为空"; return 1; }
-    reading "输入绑定的域名 (如 sb.example.com): " dom
-    [ -z "${dom}" ] && { r "域名不能为空 (固定隧道需要 CF 已绑定的域名)"; return 1; }
+    [ ! -f "${SB_BIN}" ] && { r "尚未安装 sing-box, 请先执行菜单 1"; return 1; }
+    load_vars_from_conf
 
-    if [ ! -f "${CF_BIN}" ]; then
-        download_cloudflared || return 1
+    # 旧版配置自动升级: 生成 Argo 专用入站
+    if [ ! -f "${CONF_DIR}/argo-inbound.json" ]; then
+        y "检测到旧版配置, 需生成 Argo 专用入站 (回源端口 ${ARGO_DEFAULT_PORT})"
+        reading "自动升级配置? (y/n): " up_yn
+        [ "${up_yn}" = "y" ] || return 0
+        echo "${ARGO_DEFAULT_PORT}" > "${ARGO_PORT_FILE}"
+        write_argo_inbound_conf "${ARGO_SRC}"
+        open_port "${ARGO_DEFAULT_PORT}" tcp
+        if command_exists systemctl; then systemctl restart sing-box; else rc-service sing-box restart >/dev/null 2>&1; fi
+        g "配置已升级到新版结构"
     fi
 
+    echo ""
+    y "── 添加/更换 Argo 固定隧道 ──"
+    y "回源端口: ${ARGO_PORT}  (CF 的 Public Hostname Service 填 HTTP://localhost:${ARGO_PORT})"
+    y "          有 CF API Token 时自动配置, 端口可用菜单 6 随时改"
+    echo ""
+    reading "输入 Tunnel Token (CF dashboard → Networks → Tunnels → 创建): " token
+    [ -z "${token}" ] && { r "token 不能为空"; return 1; }
     echo "${token}" > "${ARGO_TOKEN_FILE}" && chmod 600 "${ARGO_TOKEN_FILE}"
+    reading "输入要绑定的域名 (如 sb.example.com): " dom
+    [ -z "${dom}" ] && { r "域名不能为空 (固定隧道需要域名)"; return 1; }
     echo "${dom}" > "${ARGO_DOMAIN_FILE}"
     echo "fixed" > "${SB_DIR}/argo_mode"
+    ARGO_MODE="fixed"
 
-    # 询问回源协议
+    rm -f "${CF_ENV}"
+    ask_cfapi_setup
+    if [ -f "${CF_ENV}" ]; then
+        cf_ensure_dns "${dom}" "${CF_TUNNEL_ID}"
+        cf_set_ingress "${dom}" "${ARGO_PORT}" || y "请手动在 CF dashboard 配置: ${dom} → HTTP://localhost:${ARGO_PORT}"
+    else
+        y "手动配置: CF dashboard → 你的 Tunnel → Public Hostname →"
+        y "   ${dom} → Service: HTTP://localhost:${ARGO_PORT}"
+    fi
+
     echo ""
-    w "选择该隧道回源的 WS 协议:"
-    w " 1) VMess-WS  (端口 ${VMESS_PORT:-P+1})"
-    w " 2) VLESS-WS  (端口 ${VLESS_PORT:-P+2})"
-    w " 3) Trojan-WS (端口 ${TROJAN_PORT:-P+3})"
+    w "选择 Argo 回源协议:"
+    w " 1) VMess-WS   2) VLESS-WS   3) Trojan-WS"
     reading "选择 [1-3, 回车默认 1]: " src_choice
     local src="vmess"
-    case "${src_choice}" in
-        2) src="vless" ;;
-        3) src="trojan" ;;
-    esac
+    case "${src_choice}" in 2) src="vless" ;; 3) src="trojan" ;; esac
     echo "${src}" > "${ARGO_SRC_FILE}"
+    write_argo_inbound_conf "${src}"
 
-    # 重写 argo 服务 (读取已存端口)
-    load_vars_from_conf
-    ARGO_MODE="fixed"
+    [ ! -f "${CF_BIN}" ] && download_cloudflared
+
     if [ "${IS_ALPINE}" = "yes" ]; then
         write_openrc_services
+        rc-service sing-box restart >/dev/null 2>&1
         rc-service argo restart >/dev/null 2>&1
     else
         write_systemd_services
+        systemctl restart sing-box
         systemctl restart argo
     fi
     sleep 3
@@ -848,53 +1102,76 @@ set_fixed_tunnel() {
     ip4=$(get_ipv4); ip6=$(get_ipv6)
     build_links "${ip4}" "${ip6}"
     build_info "${ip4}" "${ip6}"
-    g "固定隧道配置完成, 回源协议: ${src}"
+    g "固定隧道配置完成: ${dom} → ${src} (localhost:${ARGO_PORT})"
     show_info
 }
 
 switch_argo_source() {
     need_root
     load_vars_from_conf
-    [ ! -f "${ARGO_DOMAIN_FILE}" ] && { r "尚未配置 Argo 隧道"; return 1; }
+    [ ! -f "${CONF_DIR}/argo-inbound.json" ] && { r "未检测到 Argo 入站, 请先菜单 3 配置固定隧道 (或菜单 1 重装)"; return 1; }
+    [ ! -f "${ARGO_DOMAIN_FILE}" ] && { r "尚未配置 Argo 隧道域名"; return 1; }
     echo ""
+    w "当前回源端口: ${ARGO_PORT}  (改端口用菜单 6, 切协议不影响端口)"
     w "选择 Argo 回源协议:"
-    w " 1) VMess-WS  (${VMESS_PORT})"
-    w " 2) VLESS-WS  (${VLESS_PORT})"
-    w " 3) Trojan-WS (${TROJAN_PORT})"
+    w " 1) VMess-WS   2) VLESS-WS   3) Trojan-WS"
     reading "选择 [1-3]: " src_choice
-    local src port
-    case "${src_choice}" in
-        2) src="vless"; port="${VLESS_PORT}" ;;
-        3) src="trojan"; port="${TROJAN_PORT}" ;;
-        *) src="vmess"; port="${VMESS_PORT}" ;;
-    esac
+    local src="vmess"
+    case "${src_choice}" in 2) src="vless" ;; 3) src="trojan" ;; esac
     echo "${src}" > "${ARGO_SRC_FILE}"
-
-    # 临时隧道需要改 --url 端口, 重写服务
-    local mode="off"
-    [ -f "${SB_DIR}/argo_mode" ] && mode=$(cat "${SB_DIR}/argo_mode")
-    ARGO_MODE="${mode}"
-    if [ "${mode}" = "temp" ]; then
-        if [ "${IS_ALPINE}" = "yes" ]; then
-            write_openrc_services
-            rc-service argo restart >/dev/null 2>&1
-        else
-            write_systemd_services
-            systemctl restart argo
-        fi
-        sleep 5
-        local qdom
-        qdom=$(get_quick_domain)
-        [ -n "${qdom}" ] && echo "${qdom}" > "${ARGO_DOMAIN_FILE}"
+    write_argo_inbound_conf "${src}"
+    "${SB_BIN}" check -C "${CONF_DIR}" >/dev/null 2>&1 || { r "配置校验失败, 已保留原配置"; return 1; }
+    if command_exists systemctl; then
+        systemctl restart sing-box
     else
-        y "固定隧道请在 Cloudflare dashboard 将 Public Hostname 的 Service 改为: HTTP://localhost:${port}"
+        rc-service sing-box restart >/dev/null 2>&1
     fi
-
+    # 专用入站端口不变, cloudflared / CF ingress 均无需改动
     local ip4 ip6
     ip4=$(get_ipv4); ip6=$(get_ipv6)
     build_links "${ip4}" "${ip6}"
     build_info "${ip4}" "${ip6}"
     g "Argo 回源已切换为: ${src}, 节点信息已刷新"
+}
+
+change_argo_port() {
+    need_root
+    load_vars_from_conf
+    [ ! -f "${CONF_DIR}/argo-inbound.json" ] && { r "未检测到 Argo 入站, 请先菜单 3 配置固定隧道 (或菜单 1 重装)"; return 1; }
+    echo ""
+    w "当前 Argo 回源端口: ${ARGO_PORT} (默认 ${ARGO_DEFAULT_PORT})"
+    reading "输入新的回源端口 (回车恢复默认 ${ARGO_DEFAULT_PORT}): " new_port
+    [ -z "${new_port}" ] && new_port="${ARGO_DEFAULT_PORT}"
+    if ! [ "${new_port}" -ge 1000 ] 2>/dev/null || ! [ "${new_port}" -le 65535 ] 2>/dev/null; then
+        r "端口范围: 1000-65535"; return 1
+    fi
+    if [ "${new_port}" != "${ARGO_PORT}" ] && port_in_use "${new_port}"; then
+        r "端口 ${new_port} 已被占用, 换一个"; return 1
+    fi
+    ARGO_PORT="${new_port}"
+    echo "${ARGO_PORT}" > "${ARGO_PORT_FILE}"
+    write_argo_inbound_conf "$(cat "${ARGO_SRC_FILE}")"
+    open_port "${ARGO_PORT}" tcp
+    "${SB_BIN}" check -C "${CONF_DIR}" >/dev/null 2>&1 || { r "配置校验失败"; return 1; }
+    if command_exists systemctl; then
+        systemctl restart sing-box
+    else
+        rc-service sing-box restart >/dev/null 2>&1
+    fi
+    # 有 CF API 时自动同步 ingress
+    local dom
+    dom=$(argo_domain_value)
+    if [ -f "${CF_ENV}" ] && [ -n "${dom}" ] && [ "${dom}" != "PENDING" ]; then
+        cf_set_ingress "${dom}" "${ARGO_PORT}" || y "CF 同步失败, 请手动改 dashboard Service → HTTP://localhost:${ARGO_PORT}"
+    else
+        y "⚠ 记得同步修改 CF dashboard 的 Public Hostname Service → HTTP://localhost:${ARGO_PORT}"
+        y "  (配置 CF API Token 后可全自动, 见 README)"
+    fi
+    local ip4 ip6
+    ip4=$(get_ipv4); ip6=$(get_ipv6)
+    build_links "${ip4}" "${ip6}"
+    build_info "${ip4}" "${ip6}"
+    g "Argo 回源端口已改为 ${ARGO_PORT}, 节点信息已刷新"
 }
 
 load_vars_from_conf() {
@@ -915,6 +1192,10 @@ load_vars_from_conf() {
     TROJAN_PASS=$(grep -o '"password": *"[^"]*"' "${CONF_DIR}/trojan-ws.json" 2>/dev/null | head -1 | cut -d '"' -f4)
     HY2_PASS=$(grep -o '"password": *"[^"]*"' "${CONF_DIR}/hysteria2.json" 2>/dev/null | head -1 | cut -d '"' -f4)
     TUIC_PASS=$(grep -o '"password": *"[^"]*"' "${CONF_DIR}/tuic.json" 2>/dev/null | head -1 | cut -d '"' -f4)
+    ARGO_SRC="vmess"
+    [ -f "${ARGO_SRC_FILE}" ] && ARGO_SRC=$(cat "${ARGO_SRC_FILE}")
+    ARGO_PORT="${ARGO_DEFAULT_PORT}"
+    [ -f "${ARGO_PORT_FILE}" ] && ARGO_PORT=$(cat "${ARGO_PORT_FILE}")
 }
 
 view_nodes() {
@@ -1002,16 +1283,17 @@ show_menu() {
     echo ""
     w " 1. 一键安装 (全部协议 + Argo 可选)"
     w " 2. 查看节点信息与订阅"
-    w " 3. 添加/更换 Argo 固定隧道 (token)"
+    w " 3. 添加/更换 Argo 固定隧道 (token, 可配 CF API 全自动)"
     w " 4. 刷新 Argo 临时隧道域名"
     w " 5. 切换 Argo 回源协议 (vmess/vless/trojan)"
-    w " 6. 重启服务 (sing-box + argo)"
-    w " 7. 更新 sing-box 到最新版"
-    w " 8. Telegram 通知设置/重新推送"
-    w " 9. 完全卸载"
+    w " 6. 修改 Argo 回源端口 (默认 8001, 有 CF API 自动同步)"
+    w " 7. 重启服务 (sing-box + argo)"
+    w " 8. 更新 sing-box 到最新版"
+    w " 9. Telegram 通知设置/重新推送"
+    w "10. 完全卸载"
     w " 0. 退出"
     echo ""
-    reading "请选择 [0-9]: " choice
+    reading "请选择 [0-10]: " choice
 }
 
 menu_action() {
@@ -1021,15 +1303,16 @@ menu_action() {
         3) set_fixed_tunnel ;;
         4) refresh_temp_domain ;;
         5) switch_argo_source ;;
-        6) restart_services ;;
-        7) update_singbox ;;
-        8)
+        6) change_argo_port ;;
+        7) restart_services ;;
+        8) update_singbox ;;
+        9)
             setup_tg
             if [ -f "${INFO_FILE}" ]; then
                 tg_send "$(cat "${INFO_FILE}")" && g "节点信息已推送"
             fi
             ;;
-        9) uninstall_all ;;
+        10) uninstall_all ;;
         0) exit 0 ;;
         *) ;;
     esac
@@ -1059,11 +1342,13 @@ case "$1" in
         cat << EOF
 用法: bash sb.sh [选项]
   (无参数)        进入交互菜单
-  --install       非交互安装 (可配合环境变量: PORT / ARGO_TOKEN / ARGO_DOMAIN / TG_BOT_TOKEN / TG_CHAT_ID)
+  --install       非交互安装 (环境变量: PORT / ARGO_TOKEN / ARGO_DOMAIN / ARGO_PORT_ENV /
+                  CF_API_TOKEN / TG_BOT_TOKEN / TG_CHAT_ID)
   --info          查看节点信息
   --update        更新 sing-box
   --uninstall     完全卸载
 一键安装: bash <(curl -Ls ${SCRIPT_URL})
+Argo 回源端口默认 8001, 菜单 6 可随时更换 (配 CF API Token 后自动同步 CF)
 EOF
         ;;
     "") main_menu ;;
