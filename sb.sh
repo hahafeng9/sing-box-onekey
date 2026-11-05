@@ -810,9 +810,16 @@ install_all() {
     # --- 端口 ---
     local user_port="${PORT:-}"
     if [ -z "${user_port}" ]; then
+        local last_base=""
+        [ -f "${CONF_DIR}/reality.json" ] && last_base=$(grep -o '"listen_port": *[0-9]*' "${CONF_DIR}/reality.json" | head -1 | grep -o '[0-9]*')
         echo ""
-        y "设置起始端口 (6 个协议将使用 P ~ P+5, 回车随机):"
-        reading "起始端口: " user_port
+        y "设置起始端口 (6 个协议将使用 P ~ P+5):"
+        if [ -n "${last_base}" ]; then
+            reading "起始端口 (回车沿用上次端口 ${last_base}, 免改安全组): " user_port
+            [ -z "${user_port}" ] && user_port="${last_base}"
+        else
+            reading "起始端口 (回车随机): " user_port
+        fi
     fi
     if [ -n "${user_port}" ] && [ "${user_port}" -ge 1000 ] 2>/dev/null; then
         pick_ports "${user_port}" || { r "端口分配失败 (占用过多), 换个起始端口"; return 1; }
