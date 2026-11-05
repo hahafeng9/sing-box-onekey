@@ -23,13 +23,21 @@
 | VMess-WS | P+1 | WebSocket | 直连 或 Argo CDN |
 | VLESS-WS | P+2 | WebSocket | 直连 或 Argo CDN |
 | Trojan-WS | P+3 | WebSocket | 专配 Argo（TLS 由 CF 边缘终结） |
-| Hysteria2 | P+4 | UDP | 直连，自签证书 |
-| TUIC v5 | P+5 | UDP | 直连，自签证书 + BBR |
+| Hysteria2 | P+4 | UDP | 直连，自签证书，**有 IPv6 时节点优先给 v6（不易被墙）** |
+| TUIC v5 | P+5 | UDP | 直连，自签证书 + BBR，同上 IPv6 优先 |
+| **Argo 专用入站** | **8001**（可改） | WebSocket | Argo 隧道专用，协议 vmess/vless/trojan 可切换 |
+
+> ⚠ **UDP 提示**：hy2/tuic 需要 UDP 放行。云服务器（AWS/阿里云等）除系统防火墙外，
+> 还需在控制台**安全组**放行对应 UDP 端口。IPv4 被墙时换节点信息里的 IPv6 版本链接即可。
 
 ## 🚇 Cloudflare Argo 隧道
 
 - **临时隧道**：`trycloudflare.com` 免费临时域名，即开即用，重启会变（菜单一键刷新）
-- **固定隧道（token 模式）**：配合你自己的域名，在 CF dashboard 创建 Tunnel 后粘贴 token 即可，支持菜单**随时添加/更换/切换回源协议**
+- **固定隧道（token 模式）**：
+  - 回源端口**默认 8001**（CF 的 Public Hostname Service 填 `HTTP://localhost:8001`）
+  - 菜单 **3** 添加/更换隧道时可选接入 **Cloudflare API**（Token 需 `Account:Cloudflare Tunnel:Edit` + `Zone:DNS:Edit` 权限），接入后**全自动**：自动创建 DNS CNAME、自动写入 Public Hostname 回源规则
+  - 菜单 **6** 一键更换回源端口：本地入站 + CF ingress **自动同步**，无需再去 dashboard 手点
+  - 菜单 **5** 切换回源协议（vmess/vless/trojan）：专用入站设计，切换协议完全不用动 CF 配置
 
 ## 🚀 一键安装
 
@@ -47,22 +55,25 @@ bash <(curl -Ls https://raw.githubusercontent.com/hahafeng9/sing-box-onekey/main
 ```
  1. 一键安装 (全部协议 + Argo 可选)
  2. 查看节点信息与订阅
- 3. 添加/更换 Argo 固定隧道 (token)
+ 3. 添加/更换 Argo 固定隧道 (token, 可配 CF API 全自动)
  4. 刷新 Argo 临时隧道域名
  5. 切换 Argo 回源协议 (vmess/vless/trojan)
- 6. 重启服务 (sing-box + argo)
- 7. 更新 sing-box 到最新版
- 8. Telegram 通知设置/重新推送
- 9. 完全卸载
+ 6. 修改 Argo 回源端口 (默认 8001, 有 CF API 自动同步)
+ 7. 重启服务 (sing-box + argo)
+ 8. 更新 sing-box 到最新版
+ 9. Telegram 通知设置/重新推送
+10. 完全卸载
 ```
 
 ## ⚡ 非交互安装（可写进自动化）
 
 ```bash
-# 全自动：指定端口 + Argo 固定隧道 + TG 推送
+# 全自动：指定端口 + Argo 固定隧道 + CF API 全自动配置 + TG 推送
 PORT=23456 \
 ARGO_TOKEN=eyJxxxxxxxxxx \
 ARGO_DOMAIN=sb.example.com \
+ARGO_PORT_ENV=8001 \
+CF_API_TOKEN=cf-token-with-tunnel-dns-perms \
 TG_BOT_TOKEN=123456:ABC-xxx \
 TG_CHAT_ID=6408048903 \
 bash sb.sh --install
@@ -75,11 +86,20 @@ bash sb.sh --uninstall   # 完全卸载
 
 ## 🔧 Argo 固定隧道配置步骤
 
-1. [Cloudflare Zero Trust](https://one.dash.cloudflare.com/) → Networks → Tunnels → Create a tunnel → 选 Cloudflared → 命名
-2. 创建页面会显示一行安装命令，**复制其中的 token**（`eyJ...` 开头长串）
-3. 在 Public Hostname 里绑定子域名：`sb.example.com` → Service: `HTTP://localhost:<回源端口>`
-4. 运行本脚本选「固定隧道」粘贴 token 与域名即可
-5. 想换协议走隧道？菜单「5. 切换 Argo 回源协议」或直接在 CF dashboard 改 Service 端口
+### 方式一：全自动（推荐，需 CF API Token）
+1. [Cloudflare Zero Trust](https://one.dash.cloudflare.com/) → Networks → Tunnels → Create a tunnel → 选 Cloudflared → 命名 → 复制安装命令里的 **token**（`eyJ...` 开头）
+2. 去 [CF API Tokens](https://dash.cloudflare.com/profile/api-tokens) 创建 Token：权限勾 `Account → Cloudflare Tunnel → Edit` 和 `Zone → DNS → Edit`
+3. 运行脚本选菜单 3：粘贴 Tunnel Token + 输入域名 → 问是否接 API 时选 `y` → 粘贴 API Token → 从列表选你的 Tunnel
+4. 脚本自动完成 DNS CNAME + Public Hostname 回源（`HTTP://localhost:8001`），完事
+
+### 方式二：半自动（不用 API）
+1. 创建 Tunnel 拿 token，在 dashboard 手动加 Public Hostname：`sb.example.com` → Service: `HTTP://localhost:8001`
+2. 运行菜单 3：粘贴 token + 输入域名，API 那步选 `n`
+3. 以后想换回源端口：菜单 6 改完，记得去 dashboard 把 Service 端口同步改掉
+
+### 想走其他协议？
+- 菜单 5 直接切换回源协议（vmess/vless/trojan），CF 配置不用动
+- 临时隧道用户：菜单 5 同样适用
 
 ## 📁 文件位置
 
@@ -87,11 +107,13 @@ bash sb.sh --uninstall   # 完全卸载
 /etc/sing-box/
 ├── sing-box          # 官方二进制
 ├── cloudflared       # 官方二进制 (仅 Argo 模式)
-├── conf/             # 服务端配置 (每协议一个 json)
+├── conf/             # 服务端配置 (每协议一个 json + argo-inbound.json)
 ├── url.txt           # 全部节点分享链接
 ├── sub.txt           # base64 订阅内容
 ├── info.txt          # 节点信息汇总
+├── argo_port         # Argo 回源端口 (默认 8001)
 ├── argo_token        # Argo 固定隧道 token (600 权限)
+├── cf_api.env        # CF API 凭据 (600 权限, 可选)
 └── tg.env            # TG 推送配置 (600 权限)
 ```
 
