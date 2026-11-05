@@ -435,7 +435,8 @@ EOF
     if [ "${ARGO_MODE}" != "off" ]; then
         local exec_line
         if [ "${ARGO_MODE}" = "fixed" ]; then
-            exec_line="${CF_BIN} tunnel run --token $(cat "${ARGO_TOKEN_FILE}") --no-autoupdate --edge-ip-version auto --protocol http2"
+            # 注意: --protocol/--edge-ip-version 是 tunnel 父命令的 flag, 必须放在 run 之前
+            exec_line="${CF_BIN} tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token $(cat "${ARGO_TOKEN_FILE}")"
         else
             exec_line="${CF_BIN} tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
         fi
@@ -478,7 +479,7 @@ EOF
     if [ "${ARGO_MODE}" != "off" ]; then
         local exec_line
         if [ "${ARGO_MODE}" = "fixed" ]; then
-            exec_line="${CF_BIN} tunnel run --token $(cat "${ARGO_TOKEN_FILE}") --no-autoupdate --edge-ip-version auto --protocol http2"
+            exec_line="${CF_BIN} tunnel --no-autoupdate --edge-ip-version auto --protocol http2 run --token $(cat "${ARGO_TOKEN_FILE}")"
         else
             exec_line="${CF_BIN} tunnel --url http://localhost:${ARGO_PORT} --no-autoupdate --edge-ip-version auto --protocol http2"
         fi
