@@ -460,10 +460,10 @@ EOF
 
     systemctl daemon-reload
     systemctl enable sing-box >/dev/null 2>&1
-    systemctl start sing-box
+    systemctl restart sing-box
     if [ "${ARGO_MODE}" != "off" ]; then
         systemctl enable argo >/dev/null 2>&1
-        systemctl start argo
+        systemctl restart argo
     fi
 }
 
@@ -496,8 +496,8 @@ EOF
     [ -f /etc/init.d/argo ] && chmod +x /etc/init.d/argo
     rc-update add sing-box default >/dev/null 2>&1
     [ -f /etc/init.d/argo ] && rc-update add argo default >/dev/null 2>&1
-    rc-service sing-box start >/dev/null 2>&1
-    [ -f /etc/init.d/argo ] && rc-service argo start >/dev/null 2>&1
+    rc-service sing-box restart >/dev/null 2>&1
+    [ -f /etc/init.d/argo ] && rc-service argo restart >/dev/null 2>&1
 }
 
 # ---------- Cloudflare API (自动管理固定隧道 ingress / DNS) ----------
@@ -792,8 +792,19 @@ install_all() {
 
     # 已安装检测
     if [ -f "${SB_BIN}" ]; then
-        reading "检测到已安装 sing-box, 重新安装将覆盖配置, 继续? (y/n): " yn
-        [ "${yn}" != "y" ] && return 0
+        if [ -t 0 ]; then
+            reading "检测到已安装 sing-box, 重新安装将覆盖配置, 继续? (y/n): " yn
+            [ "${yn}" != "y" ] && return 0
+        else
+            w "非交互模式: 已安装, 直接覆盖重装..."
+        fi
+        # 先停旧服务: 释放端口, 避免端口顺延导致与安全组规则脱节
+        systemctl stop sing-box argo >/dev/null 2>&1
+        rc-service sing-box stop >/dev/null 2>&1
+        rc-service argo stop >/dev/null 2>&1
+        pkill -f "${SB_DIR}/sing-box" >/dev/null 2>&1
+        pkill -f "${SB_DIR}/cloudflared" >/dev/null 2>&1
+        sleep 1
     fi
 
     # --- 端口 ---
@@ -829,6 +840,18 @@ install_all() {
 
     # --- Argo 模式 ---
     ARGO_MODE="off"
+    if [ ! -t 0 ] && [ -n "${ARGO_TOKEN:-}" ]; then
+        # 非交互 + 提供了 token → 直接固定隧道
+        ARGO_MODE="fixed"
+        echo "fixed" > "${SB_DIR}/argo_mode"
+        echo "${ARGO_TOKEN}" > "${ARGO_TOKEN_FILE}" && chmod 600 "${ARGO_TOKEN_FILE}"
+        if [ -n "${ARGO_DOMAIN:-}" ]; then
+            echo "${ARGO_DOMAIN}" > "${ARGO_DOMAIN_FILE}"
+        else
+            echo "PENDING" > "${ARGO_DOMAIN_FILE}"
+        fi
+        w "非交互模式: 已通过 ARGO_TOKEN 启用固定隧道"
+    else
     echo ""
     w "── Cloudflare Argo 隧道 ──"
     w " 1) 不使用 (仅直连协议)"
@@ -873,6 +896,7 @@ install_all() {
             echo "off" > "${SB_DIR}/argo_mode"
             ;;
     esac
+    fi
     echo "vmess" > "${ARGO_SRC_FILE}"   # argo 默认回源 vmess-ws
 
     # --- Argo 回源端口 (默认 8001) ---
