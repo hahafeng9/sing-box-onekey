@@ -308,8 +308,13 @@ write_hysteria2_conf() {
     "listen": "::",
     "listen_port": ${HY2_PORT},
     "users": [ { "password": "${HY2_PASS}" } ],
+    "ignore_client_bandwidth": false,
+    "masquerade": "https://bing.com",
     "tls": {
       "enabled": true,
+      "alpn": [ "h3" ],
+      "min_version": "1.3",
+      "max_version": "1.3",
       "certificate_path": "${SB_DIR}/cert.pem",
       "key_path": "${SB_DIR}/key.key"
     }
@@ -1269,6 +1274,25 @@ uninstall_all() {
     g "已完全卸载"
 }
 
+# UDP 直连协议监听检查 (hy2 / tuic)
+udp_check() {
+    command_exists ss || return 0
+    echo ""
+    w "── UDP 直连协议 ──"
+    if ss -ulnp 2>/dev/null | grep -q ":${HY2_PORT}[[:space:]]"; then
+        g "[·] Hysteria2 UDP ${HY2_PORT}: 监听中"
+    else
+        r "[·] Hysteria2 UDP ${HY2_PORT}: 未监听! 查看: journalctl -u sing-box -e"
+    fi
+    if ss -ulnp 2>/dev/null | grep -q ":${TUIC_PORT}[[:space:]]"; then
+        g "[·] TUIC5 UDP ${TUIC_PORT}: 监听中"
+    else
+        r "[·] TUIC5 UDP ${TUIC_PORT}: 未监听! 查看: journalctl -u sing-box -e"
+    fi
+    y "💡 电脑/手机都不通且监听正常 → 云控制台安全组放行 ${HY2_PORT}/${TUIC_PORT} 的 UDP"
+    y "   (AWS: Security Groups → Inbound → Custom UDP)"
+}
+
 # ---------- Argo 链路自检/修复 ----------
 argo_diagnose() {
     need_root
@@ -1354,6 +1378,7 @@ argo_diagnose() {
     # [5] CF 边缘全链路测试
     if [ -z "${dom}" ] || [ "${dom}" = "PENDING" ]; then
         y "[5] 无隧道域名, 跳过边缘测试 (临时隧道: 菜单 4 刷新域名后再测)"
+        udp_check
         return 0
     fi
     local ecode
@@ -1407,6 +1432,8 @@ argo_diagnose() {
             fi
             ;;
     esac
+
+    udp_check
     echo ""
 }
 
